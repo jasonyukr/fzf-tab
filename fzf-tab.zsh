@@ -361,14 +361,6 @@ fzf-tab-complete() {
     fi
   done
   echoti cnorm >/dev/tty 2>/dev/null
-  # The picker (fztab, or real fzf before it) draws straight to the tty and
-  # can scroll the terminal doing it; zle has no way to know that happened,
-  # so its cached notion of what's on screen goes stale. `.redisplay` alone
-  # trusts that stale cache and diffs against it, which is how a fragment of
-  # an old row (the prompt line, mid-scroll) can survive on screen after
-  # this returns. `zle -I` is the documented fix: invalidate zle's display
-  # so the next redraw is from scratch rather than a diff.
-  zle -I
   zle .redisplay
   (( _ftb_accept )) && zle .accept-line
   return $ret
