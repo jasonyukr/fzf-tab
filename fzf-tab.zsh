@@ -133,7 +133,7 @@ builtin unalias -m '[^+]*'
 
 -ftb-complete() {
   local -Ua _ftb_groups
-  local choice choices _ftb_curcontext continuous_trigger print_query accept_line bs=$'\2' nul=$'\0'
+  local choice choices _ftb_curcontext continuous_trigger print_query accept_line bs=$'\2'
   local ret=0
 
   # must run with user options; don't move `emulate -L zsh` above this line
@@ -143,81 +143,127 @@ builtin unalias -m '[^+]*'
 
   emulate -L zsh -o extended_glob
 
-  local _ftb_query _ftb_complist=() _ftb_headers=() command opts
-  -ftb-generate-complist # sets `_ftb_complist`
+  (( $#_ftb_compcap == 0 )) && return 1
 
   -ftb-zstyle -s continuous-trigger continuous_trigger || {
     [[ $OSTYPE == cygwin ]] && continuous_trigger=// || continuous_trigger=/
   }
+  -ftb-zstyle -s print-query print_query || print_query=alt-enter
+  -ftb-zstyle -s accept-line accept_line
 
-  case $#_ftb_complist in
-    0) return 1;;
-    1)
-      choices=("EXPECT_KEY" "${_ftb_compcap[1]%$bs*}")
-      if (( _ftb_continue_last )); then
-        choices[1]=$continuous_trigger
+  # A single candidate, or several records that all resolve to the same word
+  # (one file matched through more than one completion context), never opens
+  # the picker. This is the one piece of `-ftb-generate-complist` that still
+  # runs here rather than in `fztab`: the full complist (coloring, dedup,
+  # sort) isn't needed just to know whether every record shares one word.
+  local -i same_word=1
+  if (( $#_ftb_compcap > 1 )); then
+    local k v first_word
+    for k v in "${(@ps:\2:)_ftb_compcap}"; do
+      local -A rec=("${(@0)v}")
+      if [[ -z $first_word ]]; then
+        first_word=$rec[word]
+      elif [[ $rec[word] != $first_word ]]; then
+        same_word=0
+        break
       fi
-      ;;
-    *)
-      # Check for 'force' in compstate[list]:
-      # _approximate sets compstate[list] to "force" when showing corrections.
-      # If we don't check for this, fzf-tab sees an "unambiguous" prefix and exits early,
-      # which falls back to the standard Zsh menu.
-      if (( ! _ftb_continue_last )) \
-        && [[ $compstate[insert] == *"unambiguous" ]] \
-        && [[ -n $compstate[unambiguous] ]] \
-        && [[ "$compstate[unambiguous]" != "$compstate[quote]$IPREFIX$PREFIX$compstate[quote]" ]] \
-        && [[ $compstate[list] != *"force"* ]]; then
-        compstate[list]=
-        compstate[insert]=unambiguous
-        _ftb_finish=1
-        return 0
+    done
+  fi
+
+  if (( $#_ftb_compcap == 1 || same_word )); then
+    choices=("EXPECT_KEY" 1)
+    if (( _ftb_continue_last )); then
+      choices[1]=$continuous_trigger
+    fi
+  else
+    # Check for 'force' in compstate[list]:
+    # _approximate sets compstate[list] to "force" when showing corrections.
+    # If we don't check for this, fzf-tab sees an "unambiguous" prefix and exits early,
+    # which falls back to the standard Zsh menu.
+    if (( ! _ftb_continue_last )) \
+      && [[ $compstate[insert] == *"unambiguous" ]] \
+      && [[ -n $compstate[unambiguous] ]] \
+      && [[ "$compstate[unambiguous]" != "$compstate[quote]$IPREFIX$PREFIX$compstate[quote]" ]] \
+      && [[ $compstate[list] != *"force"* ]]; then
+      compstate[list]=
+      compstate[insert]=unambiguous
+      _ftb_finish=1
+      return 0
+    fi
+
+    # Everything downstream of the raw capture — coloring, grouping, sorting,
+    # the header, the query, the picker itself, and group-switching — is
+    # `fztab` now; see `src/cmd_fztab.rs`. This just dumps the capture to the
+    # two temp files it always wrote (for the old preview template) and reads
+    # back (query, expect-key, chosen 1-based indices into `_ftb_compcap`).
+    local tmp_dir=${TMPPREFIX:-/tmp/zsh}-fzf-tab-$USER
+    [[ -d $tmp_dir ]] || command mkdir $tmp_dir
+    local compcap_file="$tmp_dir/compcap.$$"
+    local groups_file="$tmp_dir/groups.$$"
+    print -rl -- $_ftb_compcap > $compcap_file
+    print -rl -- $_ftb_groups  > $groups_file
+
+    local show_group prefix
+    local -a switch_group presort_args
+    -ftb-zstyle -s show-group show_group || show_group=full
+    -ftb-zstyle -s prefix prefix || {
+      zstyle -m ':completion:*:descriptions' format '*' && prefix='·'
+    }
+    -ftb-zstyle -a switch-group switch_group || switch_group=('<' '>')
+
+    zstyle -T ":completion:$_ftb_curcontext" sort
+    (( $? == 1 )) && presort_args=(--no-presort)
+
+    # Every scalar here must stay quoted: an *unquoted* empty parameter
+    # vanishes entirely in zsh rather than passing through as an empty word
+    # (unlike bash), which silently shifts every flag after it by one —
+    # `$accept_line`/`$RBUFFER` are routinely empty (no zstyle set, cursor at
+    # end of line) and did exactly that.
+    local fztab_out
+    fztab_out="$(fztab --compcap-file "$compcap_file" --groups-file "$groups_file" \
+      --rbuffer "$RBUFFER" --show-group "$show_group" --prefix "$prefix" \
+      --group-prev "$switch_group[1]" --group-next "$switch_group[2]" \
+      --continuous-trigger "$continuous_trigger" --print-query-key "$print_query" \
+      --accept-line-key "$accept_line" $presort_args)"
+    ret=$?
+    command rm -f $compcap_file $groups_file
+
+    choices=("${(@f)fztab_out}")
+    # choices=(query_string expect_key idx1 idx2 ...)
+
+    # Handle the "print-query" action (e.g., Alt-Enter)
+    # or what the user manually typed in the fzf search bar, for which there is no match
+    # among the available options
+    #
+    # The next block allows the user to insert the raw text typed into the fzf prompt
+    # instead of selecting a generated match from the list.
+    #
+    # Logic:
+    # 1. Restore the original completion context (PREFIX, IPREFIX, etc.) from _ftb_compcap
+    #    so Zsh knows exactly which part of the command line to replace.
+    # 2. Use `builtin compadd` to insert the raw query string ($choices[1]) as the match.
+    if [[ $choices[2] == $print_query ]] || [[ -n $choices[1] && $#choices == 1 ]] ; then
+      local -A v=("${(@0)${_ftb_compcap[1]}}")
+      local -a args=("${(@ps:\1:)v[args]}")
+      [[ -z $args[1] ]] && args=()  # don't pass an empty string
+      IPREFIX=$v[IPREFIX] PREFIX=$v[PREFIX] SUFFIX=$v[SUFFIX] ISUFFIX=$v[ISUFFIX]
+      # NOTE: should I use `-U` here?, ../f\tabcd -> ../abcd
+      builtin compadd "${args[@]:--Q}" -Q -- $choices[1]
+
+      compstate[list]=
+      compstate[insert]=
+      if (( $#choices[1] > 0 )); then
+          compstate[insert]='1'
+          [[ $RBUFFER == ' '* ]] || compstate[insert]+=' '
       fi
+      _ftb_finish=1
+      return $ret
+    fi
+    choices[1]=()
+    # choices=(expect_key idx1 idx2 ...)
 
-      -ftb-generate-query      # sets `_ftb_query`
-      -ftb-generate-header     # sets `_ftb_headers`
-      -ftb-zstyle -s print-query print_query || print_query=alt-enter
-      -ftb-zstyle -s accept-line accept_line
-
-      choices=("${(@f)"$(builtin print -rl -- $_ftb_headers $_ftb_complist | -ftb-fzf)"}")
-      ret=$?
-      # choices=(query_string expect_key returned_word)
-
-      # Handle the "print-query" action (e.g., Alt-Enter)
-      # or what the user manually typed in the fzf search bar, for which there is no match
-      # among the available options
-      #
-      # The next block allows the user to insert the raw text typed into the fzf prompt
-      # instead of selecting a generated match from the list.
-      #
-      # Logic:
-      # 1. Restore the original completion context (PREFIX, IPREFIX, etc.) from _ftb_compcap
-      #    so Zsh knows exactly which part of the command line to replace.
-      # 2. Use `builtin compadd` to insert the raw query string ($choices[1]) as the match.
-      if [[ $choices[2] == $print_query ]] || [[ -n $choices[1] && $#choices == 1 ]] ; then
-        local -A v=("${(@0)${_ftb_compcap[1]}}")
-        local -a args=("${(@ps:\1:)v[args]}")
-        [[ -z $args[1] ]] && args=()  # don't pass an empty string
-        IPREFIX=$v[IPREFIX] PREFIX=$v[PREFIX] SUFFIX=$v[SUFFIX] ISUFFIX=$v[ISUFFIX]
-        # NOTE: should I use `-U` here?, ../f\tabcd -> ../abcd
-        builtin compadd "${args[@]:--Q}" -Q -- $choices[1]
-
-        compstate[list]=
-        compstate[insert]=
-        if (( $#choices[1] > 0 )); then
-            compstate[insert]='1'
-            [[ $RBUFFER == ' '* ]] || compstate[insert]+=' '
-        fi
-        _ftb_finish=1
-        return $ret
-      fi
-      choices[1]=()
-
-      choices=("${(@)${(@)choices%$nul*}#*$nul}")
-
-      unset CTXT
-      ;;
-  esac
+    unset CTXT
+  fi
 
   if [[ -n $choices[1] && $choices[1] == $continuous_trigger ]]; then
     typeset -gi _ftb_continue=1
@@ -238,13 +284,11 @@ builtin unalias -m '[^+]*'
 }
 
 _fzf-tab-apply() {
-  local choice bs=$'\2'
+  local choice idx bs=$'\2'
   for choice in "$_ftb_choices[@]"; do
-    local match=${_ftb_compcap[(r)${(b)choice}$bs*]}
-    if [[ -z $match ]]; then
-      local qchoice=${(q)choice}
-      match=${_ftb_compcap[(r)${(b)qchoice}$bs*]}
-    fi
+    idx=$choice
+    [[ -z $idx ]] && continue
+    local match=$_ftb_compcap[$idx]
     [[ -z $match ]] && continue
     local -A v=("${(@0)${match#*$bs}}")
     local -a args=("${(@ps:\1:)v[args]}")
@@ -521,24 +565,10 @@ typeset -ga _ftb_group_colors=(
           "See https://github.com/Aloxaf/fzf-tab/pull/132 for more information%f%b"
   fi
 
-  if [[ -n $FZF_TAB_HOME/modules/Src/aloxaf/fzftab.(so|bundle)(#qN) ]]; then
-    module_path+=("$FZF_TAB_HOME/modules/Src")
-    zmodload aloxaf/fzftab # if this fails, we fall back to ls-colors.zsh below
-
-    if [[ $FZF_TAB_MODULE_VERSION != "0.2.2" ]]; then
-      zmodload -u aloxaf/fzftab
-      local rebuild
-      print -Pn "%F{yellow}fzftab module needs to be rebuild, rebuild now?[Y/n]:%f"
-      read -q rebuild
-      if [[ $rebuild == y ]]; then
-        build-fzf-tab-module
-        zmodload aloxaf/fzftab
-      fi
-    fi
-  fi
-
-  # Only needed when the module is not available (or failed to load).
-  [[ $FZF_TAB_MODULE_VERSION = "0.2.2" ]] || source "$FZF_TAB_HOME"/lib/zsh-ls-colors/ls-colors.zsh fzf-tab-lscolors
+  # The compiled `aloxaf/fzftab` module and its `zsh-ls-colors` fallback are
+  # not vendored here: candidate coloring is `fztab`'s job now (see
+  # `-ftb-complete`), not `-ftb-colorize`'s. `modules/` and `lib/zsh-ls-colors/`
+  # are gone from this fork accordingly.
 }
 
 enable-fzf-tab
