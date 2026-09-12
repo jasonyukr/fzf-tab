@@ -204,7 +204,7 @@ builtin unalias -m '[^+]*'
     print -rl -- $_ftb_groups  > $groups_file
 
     local show_group prefix
-    local -a switch_group presort_args
+    local -a switch_group presort_args open_args
     -ftb-zstyle -s show-group show_group || show_group=full
     -ftb-zstyle -s prefix prefix || {
       zstyle -m ':completion:*:descriptions' format '*' && prefix='·'
@@ -213,6 +213,13 @@ builtin unalias -m '[^+]*'
 
     zstyle -T ":completion:$_ftb_curcontext" sort
     (( $? == 1 )) && presort_args=(--no-presort)
+
+    # The window unrolls only when it is actually opening. Every round after
+    # the first in one <TAB> session -- the continuous trigger ('/') loops
+    # back through here with a fresh `fztab` process -- draws over a window
+    # the eye is already on, and replaying the unroll there reads as the
+    # menu closing and reopening under the hand.
+    (( _ftb_continue_last )) && open_args=(--no-animation)
 
     # Every scalar here must stay quoted: an *unquoted* empty parameter
     # vanishes entirely in zsh rather than passing through as an empty word
@@ -224,7 +231,7 @@ builtin unalias -m '[^+]*'
       --rbuffer "$RBUFFER" --show-group "$show_group" --prefix "$prefix" \
       --group-prev "$switch_group[1]" --group-next "$switch_group[2]" \
       --continuous-trigger "$continuous_trigger" --print-query-key "$print_query" \
-      --accept-line-key "$accept_line" $presort_args)"
+      --accept-line-key "$accept_line" $presort_args $open_args)"
     ret=$?
     command rm -f $compcap_file $groups_file
 
